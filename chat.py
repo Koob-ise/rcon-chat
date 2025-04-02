@@ -29,6 +29,10 @@ LOG_FILE = config.get('DEFAULT', 'log-file', fallback='logs/latest.log')
 log_content = ""
 chat_log = []
 
+MESSAGE_COOLDOWN = 1.0
+last_discord_msg_time = 0
+last_telegram_msg_time = 0
+
 def escape_md(text):
     escape_chars = '_*[]()~`>#+-=|{}.!'
     return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
@@ -177,7 +181,6 @@ def update_log_content():
         time.sleep(0.5)
 
 def process_log_changes(new_content):
-    global chat_log
     try:
         for line in new_content.splitlines():
             if re.search(r'^\[\d{2}:\d{2}:\d{2}\] \[Server thread/INFO\]: <([^>]+)> (.+)', line):
@@ -186,27 +189,21 @@ def process_log_changes(new_content):
                     username = match.group(1)
                     message = match.group(2).strip()
                     
-                    msg_id = f"{username}:{message}"
-                    if msg_id not in chat_log:
-                        chat_log.append(msg_id)
-                        print(f"Found message: {username}: {message}")
+                    print(f"Found message: {username}: {message}")
+                    
+                    if d and discord_bot:
+                        asyncio.run_coroutine_threadsafe(
+                            send_discord_message(f"**{username}**: {message}"),
+                            discord_bot.loop
+                        )
                         
-                        if d and discord_bot:
-                            asyncio.run_coroutine_threadsafe(
-                                send_discord_message(f"**{username}**: {message}"),
-                                discord_bot.loop
-                            )
-                            
-                        if t and telegram_bot:
-                            asyncio.run_coroutine_threadsafe(
-                                send_telegram_message(f"{username}: {message}"),
-                                telegram_loop
-                            )
+                    if t and telegram_bot:
+                        asyncio.run_coroutine_threadsafe(
+                            send_telegram_message(f"{username}: {message}"),
+                            telegram_loop
+                        )
                 except Exception as e:
                     print(f"Parse error: {e}\nLine: {line}")
-                    
-        if len(chat_log) > 1000:
-            chat_log = chat_log[-1000:]
     except Exception as e:
         print(f'Log processing error: {e}')
 
@@ -214,6 +211,13 @@ if d:
     discord_bot = commands.Bot(command_prefix="!", intents=disnake.Intents.all())
 
     async def send_discord_message(text):
+        global last_discord_msg_time
+        
+        current_time = time.time()
+        if current_time - last_discord_msg_time < MESSAGE_COOLDOWN:
+            print(f"[Discord] Cooldown: Too fast! Waiting...")
+            await asyncio.sleep(MESSAGE_COOLDOWN - (current_time - last_discord_msg_time))
+        
         try:
             guild = discord_bot.get_guild(dserver_id)
             if not guild:
@@ -223,15 +227,12 @@ if d:
             channel = guild.get_channel(dchannel_id)
             if channel:
                 await channel.send(text)
+                last_discord_msg_time = time.time()  # Обновляем время последнего сообщения
                 print(f"Sent to Discord: {text}")
             else:
                 print(f"Discord channel {dchannel_id} not found on server {guild.name}")
         except Exception as e:
             print(f"Discord error: {e}")
-
-    @discord_bot.event
-    async def on_ready():
-        print(f'Discord Bot connected as {discord_bot.user}')
 
     @discord_bot.event
     async def on_message(message):
@@ -258,12 +259,20 @@ if t:
     telegram_loop = asyncio.new_event_loop()
 
     async def send_telegram_message(text):
+        global last_telegram_msg_time
+        
+        current_time = time.time()
+        if current_time - last_telegram_msg_time < MESSAGE_COOLDOWN:
+            print(f"[Telegram] Cooldown: Too fast! Waiting...")
+            await asyncio.sleep(MESSAGE_COOLDOWN - (current_time - last_telegram_msg_time))
+        
         try:
             await telegram_bot.send_message(
                 chat_id=tchat_id,
                 text=text,
                 parse_mode=None
             )
+            last_telegram_msg_time = time.time()  # Обновляем время последнего сообщения
             print(f"Sent to Telegram: {text}")
         except Exception as e:
             print(f"Telegram error: {e}")
