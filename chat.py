@@ -37,9 +37,6 @@ def escape_md(text):
     escape_chars = '_*[]()~`>#+-=|{}.!'
     return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
 
-import socket
-import struct
-
 class MinecraftRCON:
     def __init__(self, host, port, password):
         self.host = host
@@ -48,28 +45,79 @@ class MinecraftRCON:
         self.request_id = 0
         self.socket = None
         self._debug = True
-        self.MAX_PAYLOAD_LENGTH = 1446  # Maximum allowed payload length to prevent connection drop
+        self.MAX_PAYLOAD_LENGTH = 1446
+        self._connection_lock = threading.Lock()
+        self._reconnect_attempts = 0
+        self.MAX_RECONNECT_ATTEMPTS = 5
+        self.RECONNECT_DELAY = 5
 
     def _debug_log(self, message):
         if self._debug:
             print(f"[RCON DEBUG] {message}")
 
-    def connect(self):
+    def _ensure_connection(self):
+        """Проверяет соединение и переподключается при необходимости"""
+        with self._connection_lock:
+            if self.socket is None:
+                self._debug_log("Connection not established, attempting to connect...")
+                return self._reconnect()
+            
+            try:
+                self.socket.settimeout(1)
+                self.socket.sendall(b'')
+                return True
+            except (socket.error, OSError):
+                self._debug_log("Connection check failed, attempting to reconnect...")
+                return self._reconnect()
+    
+    def _reconnect(self):
+        """Пытается переподключиться с учетом ограничений"""
+        if self._reconnect_attempts >= self.MAX_RECONNECT_ATTEMPTS:
+            self._debug_log("Max reconnect attempts reached, giving up.")
+            return False
+            
         try:
-            self._debug_log(f"Connecting to {self.host}:{self.port}...")
+            self.disconnect()
+            time.sleep(self.RECONNECT_DELAY * (self._reconnect_attempts + 1))
+            
+            self._debug_log(f"Attempting to reconnect (attempt {self._reconnect_attempts + 1})...")
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(10)
             self.socket.connect((self.host, self.port))
-            self._debug_log("Connection established")
             
             if not self.authenticate():
-                raise Exception("Authentication failed: Wrong password")
-            self._debug_log("Authentication successful")
+                raise Exception("Authentication failed after reconnect")
+                
+            self._reconnect_attempts = 0
+            self._debug_log("Reconnection successful")
+            return True
         except Exception as e:
-            self._debug_log(f"Connection error: {e}")
-            raise
+            self._reconnect_attempts += 1
+            self._debug_log(f"Reconnection attempt {self._reconnect_attempts} failed: {e}")
+            return False
+
+    def connect(self):
+        """Инициализирует соединение с сервером RCON"""
+        with self._connection_lock:
+            try:
+                self._debug_log(f"Connecting to {self.host}:{self.port}...")
+                self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                self.socket.settimeout(10)
+                self.socket.connect((self.host, self.port))
+                self._debug_log("Connection established")
+                
+                if not self.authenticate():
+                    raise Exception("Authentication failed: Wrong password")
+                self._debug_log("Authentication successful")
+                self._reconnect_attempts = 0
+                return True
+            except Exception as e:
+                self._debug_log(f"Connection error: {e}")
+                self.disconnect()
+                return False
 
     def authenticate(self):
+        """Аутентификация на сервере RCON"""
         try:
             response_id, response = self.send_packet(3, self.password)
             self._debug_log(f"Auth response: ID={response_id}, Response={response}")
@@ -78,21 +126,30 @@ class MinecraftRCON:
             self._debug_log(f"Auth error: {e}")
             return False
 
-    def send_command(self, command):
-        try:
-            if len(command.encode('utf-8')) > self.MAX_PAYLOAD_LENGTH:
-                self._debug_log("Command too long, cannot send")
-                return "Error: Command exceeds maximum allowed length"
+    def send_command(self, command, max_retries=3):
+        """Отправляет команду на сервер с автоматическим переподключением при необходимости"""
+        for attempt in range(max_retries):
+            if not self._ensure_connection():
+                self._debug_log("No active connection, cannot send command")
+                return None
                 
-            self._debug_log(f"Sending command: {command}")
-            _, response = self.send_packet(2, command)
-            self._debug_log(f"Server response: {response}")
-            return response
-        except Exception as e:
-            self._debug_log(f"Command error: {e}")
-            return None
+            try:
+                if len(command.encode('utf-8')) > self.MAX_PAYLOAD_LENGTH:
+                    self._debug_log("Command too long, cannot send")
+                    return "Error: Command exceeds maximum allowed length"
+                    
+                self._debug_log(f"Sending command: {command}")
+                _, response = self.send_packet(2, command)
+                self._debug_log(f"Server response: {response}")
+                return response
+            except Exception as e:
+                self._debug_log(f"Command error (attempt {attempt + 1}): {e}")
+                if attempt == max_retries - 1:
+                    return None
+                time.sleep(1)
 
     def send_packet(self, packet_type, payload):
+        """Отправляет пакет на сервер RCON"""
         if len(payload.encode('utf-8')) > self.MAX_PAYLOAD_LENGTH:
             raise Exception("Payload exceeds maximum allowed length")
 
@@ -112,11 +169,13 @@ class MinecraftRCON:
             self.socket.sendall(packet)
         except Exception as e:
             self._debug_log(f"Packet error: {e}")
+            self.disconnect()
             raise
 
         return self._receive_response()
 
     def _receive_response(self):
+        """Получает ответ от сервера RCON"""
         try:
             length_data = self.socket.recv(4)
             if not length_data:
@@ -140,19 +199,21 @@ class MinecraftRCON:
             
         except Exception as e:
             self._debug_log(f"Response error: {e}")
+            self.disconnect()
             raise
 
     def disconnect(self):
+        """Закрывает соединение с сервером RCON"""
         if self.socket:
             try:
                 self.socket.close()
                 self._debug_log("Connection closed")
-            except:
-                pass
+            except Exception as e:
+                self._debug_log(f"Error while disconnecting: {e}")
             finally:
                 self.socket = None
 
-
+# Остальной код остается без изменений
 def debug_log_reading():
     try:
         print(f"\n=== Debug: Log check ===")
@@ -239,7 +300,7 @@ if d:
             channel = guild.get_channel(dchannel_id)
             if channel:
                 await channel.send(text)
-                last_discord_msg_time = time.time()  # Обновляем время последнего сообщения
+                last_discord_msg_time = time.time()
                 print(f"Sent to Discord: {text}")
             else:
                 print(f"Discord channel {dchannel_id} not found on server {guild.name}")
@@ -284,7 +345,7 @@ if t:
                 text=text,
                 parse_mode=None
             )
-            last_telegram_msg_time = time.time()  # Обновляем время последнего сообщения
+            last_telegram_msg_time = time.time()
             print(f"Sent to Telegram: {text}")
         except Exception as e:
             print(f"Telegram error: {e}")
@@ -323,7 +384,18 @@ def main():
         port=int(config.get('DEFAULT', 'rcon-port')),
         password=config.get('DEFAULT', 'rcon-password')
     )
-    rcon.connect()
+    
+    connected = False
+    for attempt in range(3):
+        if rcon.connect():
+            connected = True
+            break
+        print(f"Connection attempt {attempt + 1} failed, retrying in 20 seconds...")
+        time.sleep(20)
+    
+    if not connected:
+        print("Failed to establish RCON connection after 3 attempts. Exiting.")
+        return
 
     log_thread = threading.Thread(target=update_log_content, daemon=True)
     log_thread.start()
