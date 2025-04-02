@@ -29,13 +29,16 @@ LOG_FILE = config.get('DEFAULT', 'log-file', fallback='logs/latest.log')
 log_content = ""
 chat_log = []
 
-MESSAGE_COOLDOWN = 1.0
+MESSAGE_COOLDOWN = 5.0
 last_discord_msg_time = 0
 last_telegram_msg_time = 0
 
 def escape_md(text):
     escape_chars = '_*[]()~`>#+-=|{}.!'
     return ''.join(f'\\{char}' if char in escape_chars else char for char in text)
+
+import socket
+import struct
 
 class MinecraftRCON:
     def __init__(self, host, port, password):
@@ -45,6 +48,7 @@ class MinecraftRCON:
         self.request_id = 0
         self.socket = None
         self._debug = True
+        self.MAX_PAYLOAD_LENGTH = 1446  # Maximum allowed payload length to prevent connection drop
 
     def _debug_log(self, message):
         if self._debug:
@@ -76,6 +80,10 @@ class MinecraftRCON:
 
     def send_command(self, command):
         try:
+            if len(command.encode('utf-8')) > self.MAX_PAYLOAD_LENGTH:
+                self._debug_log("Command too long, cannot send")
+                return "Error: Command exceeds maximum allowed length"
+                
             self._debug_log(f"Sending command: {command}")
             _, response = self.send_packet(2, command)
             self._debug_log(f"Server response: {response}")
@@ -85,6 +93,9 @@ class MinecraftRCON:
             return None
 
     def send_packet(self, packet_type, payload):
+        if len(payload.encode('utf-8')) > self.MAX_PAYLOAD_LENGTH:
+            raise Exception("Payload exceeds maximum allowed length")
+
         self.request_id += 1
         payload_utf8 = payload.encode('utf-8')
         
@@ -140,6 +151,7 @@ class MinecraftRCON:
                 pass
             finally:
                 self.socket = None
+
 
 def debug_log_reading():
     try:
